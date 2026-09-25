@@ -42,3 +42,12 @@ PYTHONPATH=src python3 -m urban_network.api --database network.sqlite3 --host 12
 ```
 
 `GET /health` 返回服务状态，其余接口使用 JSON 和 `Authorization: Bearer <token>` 会话，支持管段登记、读数上报、风险查询、工单创建和应急资源分配。
+
+## 工单流转
+
+`POST /work-orders/{id}/transitions` 按前置版本流转工单，请求体为 `{"target","reason","expected_version","request_id?"}`：
+
+- 同一前置版本最多成功一次：版本不匹配返回 `409 conflict`，冲突提交与生效提交一起保留，`GET /work-orders/{id}/conflicts` 供调度员核对双方内容；
+- 已完成或已取消的工单是终态，旧版本请求无法重新打开；
+- 完全相同的重试（含可选的 `request_id` 幂等键）返回 `200` 与原决定（`replayed: true`），不重复落库；
+- 状态变化、流转决定、冲突记录与审计事件在同一事务中提交，重启后保持一致。
