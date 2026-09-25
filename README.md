@@ -42,3 +42,15 @@ PYTHONPATH=src python3 -m urban_network.api --database network.sqlite3 --host 12
 ```
 
 `GET /health` 返回服务状态，其余接口使用 JSON 和 `Authorization: Bearer <token>` 会话，支持管段登记、读数上报、风险查询、工单创建和应急资源分配。
+
+### 工单流转的版本条件
+
+`POST /work-orders/{id}/transitions` 接收 `{target, reason, expected_version}`，用乐观并发控制裁决工单状态变化：
+
+- 每张工单携带单调递增的 `version`（创建时为 1），流转请求必须带上读取到的 `expected_version`；同一前置版本最多被成功消费一次，先到者生效，其余请求得到 `409`。
+- 已完成或已取消的工单是终态，任何携带旧版本的迟到请求都无法重新打开它们。
+- 内容完全相同的重试（同一提交人、同一版本、同一目标和理由）按请求摘要识别，幂等地返回首次裁决结果，不重复改状态、不重复写审计。
+- 真正冲突的请求不会丢失：服务把双方提交（目标、理由、提交人、期望版本）和胜出版本一并记录在 `work_order_decisions` 表，调度员可通过 `GET /work-orders/{id}/decisions` 核对。
+- 状态变更、裁决记录和审计事件在同一个 `BEGIN IMMEDIATE` 事务内提交，审计按 `event_id` 单调排列，重启后仍可完整核对。
+
+响应状态码：`200` 流转生效或幂等重放成功，`409` 版本冲突或终态拒绝，`404` 工单不存在，`422` 缺少或非法的 `expected_version`。

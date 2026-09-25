@@ -1,12 +1,17 @@
 """协调管网监测、告警、工单和应急资源分配的应用服务。"""
 from __future__ import annotations
-import hashlib,uuid
+import hashlib,json,sqlite3,threading,uuid
 from .auth import Auth
+from .errors import Conflict,ValidationFailed
 from .models import Reading,Segment,as_dict,utcnow
 from .risk import leak_probability,score_reading
 from .storage import audit,connect,rows,transaction
+WORK_ORDER_TRANSITIONS={"open":{"assigned","cancelled"},"assigned":{"in_progress","cancelled"},"in_progress":{"completed","blocked"},"blocked":{"in_progress","cancelled"},"completed":set(),"cancelled":set()}
+TERMINAL_STATUSES={"completed","cancelled"}
+def _decision_digest(work_order_id,actor,expected_version,target,reason):
+    return hashlib.sha256(f"{work_order_id}|{actor}|{expected_version}|{target}|{reason}".encode()).hexdigest()
 class NetworkService:
-    def __init__(self,database=":memory:"): self.db=connect(database); self.auth=Auth(self.db)
+    def __init__(self,database=":memory:"): self.db=connect(database); self.auth=Auth(self.db); self._lock=threading.RLock()
     def bootstrap(self):
         for uid,pwd,role in (("admin","network-admin","admin"),("operator","network-operator","operator")):
             try:self.auth.create_user(uid,pwd,role)
@@ -38,21 +43,89 @@ class NetworkService:
         if not assignee.strip() or not 1<=priority<=5:raise ValueError("assignee and priority are invalid")
         if not self.db.execute("SELECT 1 FROM alerts WHERE alert_id=? AND segment_id=?",(alert_id,segment_id)).fetchone():raise KeyError(alert_id)
         wid="wo-"+uuid.uuid4().hex[:16]
-        with transaction(self.db): self.db.execute("INSERT INTO work_orders VALUES(?,?,?,?,?,?,?,?)",(wid,segment_id,alert_id,assignee,"open",priority,utcnow(),utcnow())); audit(self.db,"work_order",wid,"created",actor.user_id,{"segment_id":segment_id,"alert_id":alert_id})
+        with transaction(self.db): self.db.execute("INSERT INTO work_orders(work_order_id,segment_id,alert_id,assignee,status,priority,created_at,updated_at,version) VALUES(?,?,?,?,?,?,?,?,1)",(wid,segment_id,alert_id,assignee,"open",priority,utcnow(),utcnow())); audit(self.db,"work_order",wid,"created",actor.user_id,{"segment_id":segment_id,"alert_id":alert_id})
         return self.work_order(token,wid)
     def work_order(self,token,work_order_id):
         self.auth.require(token,"read"); row=self.db.execute("SELECT * FROM work_orders WHERE work_order_id=?",(work_order_id,)).fetchone()
         if not row:raise KeyError(work_order_id)
         return dict(row)
-    def transition_work_order(self,token,work_order_id,target,reason):
-        actor=self.auth.require(token,"work_order"); allowed={"open":{"assigned","cancelled"},"assigned":{"in_progress","cancelled"},"in_progress":{"completed","blocked"},"blocked":{"in_progress","cancelled"},"completed":set(),"cancelled":set()}
-        if not reason.strip():raise ValueError("transition reason is required")
-        with transaction(self.db):
-            row=self.db.execute("SELECT status FROM work_orders WHERE work_order_id=?",(work_order_id,)).fetchone()
-            if not row:raise KeyError(work_order_id)
-            if target not in allowed.get(row[0],set()):raise ValueError("invalid work order transition")
-            self.db.execute("UPDATE work_orders SET status=?,updated_at=? WHERE work_order_id=?",(target,utcnow(),work_order_id)); audit(self.db,"work_order",work_order_id,"transition",actor.user_id,{"from":row[0],"to":target,"reason":reason})
-        return self.work_order(token,work_order_id)
+    def _decision_body(self,row):
+        return json.loads(row["response_json"])
+    def _insert_decision(self,now,work_order_id,expected_version,actor,target,reason,digest,outcome,from_status,from_version,resulting_version,body):
+        self.db.execute("INSERT INTO work_order_decisions(decision_id,work_order_id,expected_version,actor,target,reason,request_sha256,outcome,from_status,from_version,resulting_version,response_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",(body["decision_id"],work_order_id,expected_version,actor,target,reason,digest,outcome,from_status,from_version,resulting_version,json.dumps(body,ensure_ascii=False,sort_keys=True),now))
+    def _conflict_body(self,now,work_order_id,expected_version,actor,target,reason,detail):
+        order=self.db.execute("SELECT status,version FROM work_orders WHERE work_order_id=?",(work_order_id,)).fetchone()
+        winner=self.db.execute("SELECT actor,target,reason,resulting_version FROM work_order_decisions WHERE work_order_id=? AND expected_version=? AND outcome='applied'",(work_order_id,expected_version)).fetchone()
+        body={"decision_id":"dec-"+uuid.uuid4().hex[:16],"outcome":"conflicted","work_order_id":work_order_id,"expected_version":expected_version,"detail":detail,"current_status":order["status"],"current_version":order["version"],"submission":{"actor":actor,"target":target,"reason":reason},"replayed":False}
+        if winner:body["winner"]={"actor":winner["actor"],"target":winner["target"],"reason":winner["reason"],"resulting_version":winner["resulting_version"]}
+        return order,body
+    @staticmethod
+    def _audit_conflict(body):
+        payload={k:body[k] for k in ("decision_id","expected_version","detail","current_status","current_version")}
+        payload["submission"]=dict(body["submission"])
+        if "winner" in body: payload["winner"]=body["winner"]
+        return payload
+    def _persist_conflict(self,now,work_order_id,expected_version,actor_id,target,reason,digest,detail):
+        order,body=self._conflict_body(now,work_order_id,expected_version,actor_id,target,reason,detail)
+        self._insert_decision(now,work_order_id,expected_version,actor_id,target,reason,digest,"conflicted",order["status"],order["version"],None,body)
+        audit(self.db,"work_order",work_order_id,"transition_conflicted",actor_id,self._audit_conflict(body))
+        return body
+    def _replay_or_raise(self,prior):
+        replay=self._decision_body(prior); replay["replayed"]=True
+        if prior["outcome"]=="conflicted": raise Conflict("work order transition conflict",replay)
+        return replay
+    def _resolve_after_losing_race(self,work_order_id,actor_id,target,reason,expected_version,digest):
+        # 先到者已占据该前置版本或相同请求摘要：读取并重放原决定；若本方请求尚未落库则登记为冲突。
+        for _ in range(100):
+            try:
+                with transaction(self.db):
+                    prior=self.db.execute("SELECT response_json,outcome FROM work_order_decisions WHERE work_order_id=? AND request_sha256=?",(work_order_id,digest)).fetchone()
+                    if prior is not None: return self._replay_or_raise(prior)
+                    order=self.db.execute("SELECT status,version FROM work_orders WHERE work_order_id=?",(work_order_id,)).fetchone()
+                    detail="work order is already "+order["status"] if order["status"] in TERMINAL_STATUSES else f"expected version {expected_version} but current version is {order['version']}"
+                    return self._persist_conflict(utcnow(),work_order_id,expected_version,actor_id,target,reason,digest,detail)
+            except sqlite3.IntegrityError:
+                continue  # 另一连接刚登记了相同请求，回滚后下一轮重放其决定。
+        raise RuntimeError("could not settle work order transition after repeated races")
+    def transition_work_order(self,token,work_order_id,target,reason,expected_version):
+        actor=self.auth.require(token,"work_order")
+        if not isinstance(expected_version,int) or isinstance(expected_version,bool) or expected_version<1:raise ValidationFailed("expected_version must be a positive integer")
+        if not isinstance(target,str) or not target.strip():raise ValidationFailed("transition target is required")
+        if not isinstance(reason,str) or not reason.strip():raise ValidationFailed("transition reason is required")
+        digest=_decision_digest(work_order_id,actor.user_id,expected_version,target,reason)
+        # 同一连接被 HTTP 线程共享，锁与 BEGIN IMMEDIATE 共同保证请求按到达顺序串行裁决。
+        with self._lock:
+            try:
+                with transaction(self.db):
+                    row=self.db.execute("SELECT status,version FROM work_orders WHERE work_order_id=?",(work_order_id,)).fetchone()
+                    if not row:raise KeyError(work_order_id)
+                    prior=self.db.execute("SELECT response_json,outcome FROM work_order_decisions WHERE work_order_id=? AND request_sha256=?",(work_order_id,digest)).fetchone()
+                    if prior is not None:
+                        return self._replay_or_raise(prior)
+                    now=utcnow(); detail=None
+                    if row["status"] in TERMINAL_STATUSES: detail="work order is already "+row["status"]
+                    elif row["version"]!=expected_version: detail=f"expected version {expected_version} but current version is {row['version']}"
+                    elif target not in WORK_ORDER_TRANSITIONS.get(row["status"],set()): detail=f"invalid work order transition from {row['status']} to {target}"
+                    if detail is not None:
+                        body=self._persist_conflict(now,work_order_id,expected_version,actor.user_id,target,reason,digest,detail)
+                    else:
+                        updated=self.db.execute("UPDATE work_orders SET status=?,version=version+1,updated_at=? WHERE work_order_id=? AND version=?",(target,now,work_order_id,expected_version)).rowcount
+                        if updated!=1:
+                            body=self._persist_conflict(now,work_order_id,expected_version,actor.user_id,target,reason,digest,f"expected version {expected_version} but current version is {row['version']}")
+                        else:
+                            current=dict(self.db.execute("SELECT * FROM work_orders WHERE work_order_id=?",(work_order_id,)).fetchone())
+                            body={"decision_id":"dec-"+uuid.uuid4().hex[:16],"outcome":"applied","work_order_id":work_order_id,"expected_version":expected_version,"resulting_version":expected_version+1,"replayed":False,"work_order":current}
+                            self._insert_decision(now,work_order_id,expected_version,actor.user_id,target,reason,digest,"applied",row["status"],row["version"],expected_version+1,body)
+                            audit(self.db,"work_order",work_order_id,"transition_applied",actor.user_id,{"decision_id":body["decision_id"],"from":row["status"],"to":target,"reason":reason,"expected_version":expected_version,"resulting_version":expected_version+1})
+            except sqlite3.IntegrityError:
+                # 多连接/多进程并发：同一前置版本的 applied 行或相同请求摘要已由先到者落库。
+                body=self._resolve_after_losing_race(work_order_id,actor.user_id,target,reason,expected_version,digest)
+        if body["outcome"]=="conflicted": raise Conflict("work order transition conflict",body)
+        return body
+    def work_order_decisions(self,token,work_order_id):
+        self.auth.require(token,"read")
+        if not self.db.execute("SELECT 1 FROM work_orders WHERE work_order_id=?",(work_order_id,)).fetchone():raise KeyError(work_order_id)
+        return rows(self.db,"SELECT * FROM work_order_decisions WHERE work_order_id=? ORDER BY rowid",(work_order_id,))
     def add_resource(self,token,resource_id,kind,district,capacity):
         actor=self.auth.require(token,"admin")
         if capacity<=0 or not kind.strip() or not district.strip():raise ValueError("resource fields are invalid")
